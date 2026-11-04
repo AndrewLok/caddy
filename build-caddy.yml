@@ -1,0 +1,143 @@
+# Save as .github/workflows/build-caddy.yml
+#
+# Checks daily for a new Caddy release. When one is found (and the official
+# builder image for it has been published), builds Caddy with the modules in
+# the Containerfile, verifies the modules are present, pushes to GHCR, and
+# signs the image with cosign. Unsigned (failed) builds will be rejected by
+# the server's signature policy.
+#
+# Required repository secrets:
+#   COSIGN_PRIVATE_KEY  - contents of cosign.key
+#   COSIGN_PASSWORD     - password for cosign.key
+
+name: build-caddy
+
+on:
+  schedule:
+    - cron: "23 5 * * *" # daily
+  workflow_dispatch: # manual run always rebuilds
+  push:
+    branches: [main]
+    paths:
+      - Containerfile
+      - .github/workflows/build-caddy.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: caddy
+  # "minor": build only when a new minor version appears (2.10 -> 2.11)
+  # "patch": build on every release (2.10.1 -> 2.10.2) - recommended,
+  #          since patch releases often contain security fixes
+  BUILD_ON: patch
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      image: ${{ steps.check.outputs.image }}
+      version: ${{ steps.check.outputs.version }}
+      minor: ${{ steps.check.outputs.minor }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"   # GHCR needs lowercase
+          image="ghcr.io/${owner}/${IMAGE_NAME}"
+
+          # Latest stable Caddy release (prereleases are excluded)
+          tag=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name)
+          version="${tag#v}"        # e.g. 2.10.2
+          minor="${version%.*}"     # e.g. 2.10
+
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "minor=${minor}"
+          } >> "$GITHUB_OUTPUT"
+
+          # The Docker Hub builder image can lag behind the GitHub release.
+          if ! skopeo inspect --raw "docker://docker.io/library/caddy:${version}-builder" >/dev/null 2>&1; then
+            echo "caddy:${version}-builder not published yet; will retry next run."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$FORCE" = "true" ]; then
+            echo "Manual or config-change run: building ${version}."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$BUILD_ON" = "minor" ]; then
+            check_tag="$minor"
+          else
+            check_tag="$version"
+          fi
+
+          if skopeo inspect --raw --creds "${GITHUB_ACTOR}:${GH_TOKEN}" \
+               "docker://${image}:${check_tag}" >/dev/null 2>&1; then
+            echo "${image}:${check_tag} already exists; nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New release ${version}; building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ needs.check.outputs.image }}
+      VERSION: ${{ needs.check.outputs.version }}
+      MINOR: ${{ needs.check.outputs.minor }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          build-args: |
+            CADDY_VERSION=${{ env.VERSION }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:${{ env.MINOR }}
+            ${{ env.IMAGE }}:latest
+
+      - name: Verify modules are present
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          modules=$(docker run --rm "${IMAGE}@${DIGEST}" caddy list-modules)
+          echo "$modules" | grep -qx 'dns.providers.cloudflare'
+          echo "$modules" | grep -qx 'dns.providers.powerdns'
+          echo "Both DNS provider modules found."
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${DIGEST}"
