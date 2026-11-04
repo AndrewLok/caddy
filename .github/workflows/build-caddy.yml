@@ -32,6 +32,8 @@ env:
   # "patch": build on every release (2.10.1 -> 2.10.2) - recommended,
   #          since patch releases often contain security fixes
   BUILD_ON: patch
+  # How many older releases to try when the newest has no builder image yet
+  MAX_FALLBACK: 1
 
 jobs:
   check:
@@ -52,23 +54,42 @@ jobs:
           owner="${GITHUB_REPOSITORY_OWNER,,}"   # GHCR needs lowercase
           image="ghcr.io/${owner}/${IMAGE_NAME}"
 
-          # Latest stable Caddy release (prereleases are excluded)
-          tag=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name)
-          version="${tag#v}"        # e.g. 2.10.2
-          minor="${version%.*}"     # e.g. 2.10
+          # Stable Caddy releases, newest version first. Sorted by version
+          # rather than date, so a backported patch to an older minor
+          # version can't jump the queue.
+          versions=$(gh api "repos/caddyserver/caddy/releases?per_page=30" \
+            --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' \
+            | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V -r)
+          newest=$(echo "$versions" | head -n1)
 
+          # The Docker Hub builder image can lag behind the GitHub release.
+          # Use the newest release that has one, looking back at most
+          # MAX_FALLBACK releases so a missing tag can't cause a downgrade.
+          version=""
+          for v in $(echo "$versions" | head -n "$((MAX_FALLBACK + 1))"); do
+            if skopeo inspect --raw "docker://docker.io/library/caddy:${v}-builder" >/dev/null 2>&1; then
+              version="$v"
+              break
+            fi
+            echo "caddy:${v}-builder not published yet."
+          done
+
+          if [ -z "$version" ]; then
+            echo "No builder image found for recent releases; will retry next run."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$version" != "$newest" ]; then
+            echo "Using ${version} for now; ${newest} will be built once its builder image is published."
+          fi
+
+          minor="${version%.*}"     # e.g. 2.11
           {
             echo "image=${image}"
             echo "version=${version}"
             echo "minor=${minor}"
           } >> "$GITHUB_OUTPUT"
-
-          # The Docker Hub builder image can lag behind the GitHub release.
-          if ! skopeo inspect --raw "docker://docker.io/library/caddy:${version}-builder" >/dev/null 2>&1; then
-            echo "caddy:${version}-builder not published yet; will retry next run."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           if [ "$FORCE" = "true" ]; then
             echo "Manual or config-change run: building ${version}."
